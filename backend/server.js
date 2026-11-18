@@ -1,4 +1,6 @@
+require("dns").setDefaultResultOrder("ipv4first");
 require("dotenv").config();
+
 
 const authRoutes = require("./routes/authRoutes");
 const express = require("express");
