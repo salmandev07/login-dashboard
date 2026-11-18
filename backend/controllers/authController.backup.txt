@@ -1,0 +1,761 @@
+const crypto = require("crypto");
+const sendEmail = require("../utils/sendEmail");
+const User = require("../models/User");
+const PendingRegistration = require("../models/PendingRegistration");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+
+const registerUser = async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+
+    if (!name || !email || !password) {
+        return res.status(400).json({
+            success: false,
+            message: "Name, email and password are required",
+        });
+        }
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+        if (!emailRegex.test(email)) {
+        return res.status(400).json({
+            success: false,
+            message: "Please enter a valid email address",
+        });
+        }
+        
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters",
+      });
+    }
+
+    if(password.length > 15) {
+        return res.status(400).json({
+            success:false,
+            message: "Password must be less than 15 characters",
+        })
+    }
+
+  
+    const existingUser = await User.findOne({
+      email: email.toLowerCase().trim(),
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "Email is already registered",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+   
+    const user = await User.create({
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password: hashedPassword,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Registration successful",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error("Registration error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error during registration",
+    });
+  }
+};
+
+
+
+
+const requestRegistrationOtp = async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    const normalizedEmail = email?.trim().toLowerCase();
+    const normalizedName = name?.trim();
+
+    if (!normalizedName || !normalizedEmail || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, email and password are required.",
+      });
+    }
+
+    if (normalizedName.length < 2 || normalizedName.length > 20) {
+      return res.status(400).json({
+        success: false,
+        message: "Name must contain 2 to 20 characters.",
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    if (password.length < 8 || password.length > 15) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must contain 8 to 15 characters.",
+      });
+    }
+
+    const existingUser = await User.findOne({
+      email: normalizedEmail,
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "Email is already registered. Please log in.",
+      });
+    }
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
+
+    const otpHash = crypto
+      .createHmac("sha256", process.env.JWT_SECRET)
+      .update(otp)
+      .digest("hex");
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const now = Date.now();
+
+    await PendingRegistration.findOneAndUpdate(
+      { email: normalizedEmail },
+      {
+        name: normalizedName,
+        email: normalizedEmail,
+        passwordHash,
+        otpHash,
+        otpExpiresAt: new Date(now + 5 * 60 * 1000),
+        otpAttempts: 0,
+        resendCount: 0,
+        lastOtpSentAt: new Date(now),
+        expiresAt: new Date(now + 2 * 60 * 60 * 1000),
+      },
+      { upsert: true, new: true, runValidators: true }
+    );
+
+    try {
+      await sendEmail(
+        normalizedEmail,
+        "Verify Your Email - Registration OTP",
+        `<h2>Email Verification</h2>
+         <p>Your registration verification code is:</p>
+         <h1>${otp}</h1>
+         <p>This code expires in 5 minutes. Do not share it with anyone.</p>`
+      );
+    } catch (emailError) {
+      await PendingRegistration.deleteOne({
+        email: normalizedEmail,
+      });
+      throw emailError;
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "OTP sent to your email. Please verify to complete registration.",
+    });
+  } catch (error) {
+    console.error("Registration OTP error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to send registration OTP. Please try again.",
+    });
+  }
+};
+
+
+
+const verifyRegistrationOtp = async (req, res) => {
+  try {
+    const email = req.body.email?.trim().toLowerCase();
+    const otp = req.body.otp?.trim();
+
+    if (!email || !/^\d{6}$/.test(otp || "")) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid 6-digit OTP.",
+      });
+    }
+
+    const pending = await PendingRegistration.findOne({ email });
+
+    if (!pending) {
+      return res.status(400).json({
+        success: false,
+        message: "Registration expired. Please register again.",
+      });
+    }
+
+    if (pending.otpExpiresAt.getTime() < Date.now()) {
+      await PendingRegistration.deleteOne({ email });
+
+      return res.status(400).json({
+        success: false,
+        message: "OTP expired. Please register again.",
+      });
+    }
+
+    if (pending.otpAttempts >= 5) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many incorrect attempts. Please register again.",
+      });
+    }
+
+    const submittedHash = crypto
+      .createHmac("sha256", process.env.JWT_SECRET)
+      .update(otp)
+      .digest("hex");
+
+    const valid = crypto.timingSafeEqual(
+      Buffer.from(submittedHash, "hex"),
+      Buffer.from(pending.otpHash, "hex")
+    );
+
+    if (!valid) {
+      pending.otpAttempts += 1;
+      await pending.save();
+
+      return res.status(400).json({
+        success: false,
+        message: "Incorrect OTP.",
+        attemptsRemaining: 5 - pending.otpAttempts,
+      });
+    }
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      await PendingRegistration.deleteOne({ email });
+
+      return res.status(409).json({
+        success: false,
+        message: "Email is already registered. Please log in.",
+      });
+    }
+
+    await User.create({
+      name: pending.name,
+      email: pending.email,
+      password: pending.passwordHash,
+    });
+
+    await PendingRegistration.deleteOne({ email });
+
+    return res.status(201).json({
+      success: true,
+      message: "Email verified and registration successful. Please log in.",
+    });
+  } catch (error) {
+    console.error("Registration verification error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Registration verification failed. Please try again.",
+    });
+  }
+};
+
+
+
+const resendRegistrationOtp = async (req, res) => {
+  try {
+    const email = req.body.email?.trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Email is required.",
+      });
+    }
+
+    const pending = await PendingRegistration.findOne({ email });
+
+    if (!pending) {
+      return res.status(400).json({
+        success: false,
+        message: "Registration expired. Please register again.",
+      });
+    }
+
+    const now = Date.now();
+    const lastSent = pending.lastOtpSentAt?.getTime() || 0;
+
+    const waitTimes = [
+      30 * 1000,
+      60 * 1000,
+      2 * 60 * 1000,
+      5 * 60 * 1000,
+    ];
+
+    const waitTime =
+      pending.resendCount >= 4
+        ? 60 * 60 * 1000
+        : waitTimes[pending.resendCount];
+
+    const remaining = lastSent + waitTime - now;
+
+    if (lastSent && remaining > 0) {
+      return res.status(429).json({
+        success: false,
+        message: "Please wait before requesting another OTP.",
+        retryAfterSeconds: Math.ceil(remaining / 1000),
+      });
+    }
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
+
+    const otpHash = crypto
+      .createHmac("sha256", process.env.JWT_SECRET)
+      .update(otp)
+      .digest("hex");
+
+    await sendEmail(
+      email,
+      "Your Registration OTP",
+      `<h2>Email Verification</h2>
+       <p>Your verification code is:</p>
+       <h1>${otp}</h1>
+       <p>This code expires in 5 minutes.</p>`
+    );
+
+    pending.otpHash = otpHash;
+    pending.otpExpiresAt = new Date(now + 5 * 60 * 1000);
+    pending.otpAttempts = 0;
+    pending.lastOtpSentAt = new Date(now);
+
+    pending.resendCount =
+      pending.resendCount >= 4
+        ? 0
+        : pending.resendCount + 1;
+
+    // Keep the pending registration alive for the 1-hour wait.
+    pending.expiresAt = new Date(now + 2 * 60 * 60 * 1000);
+
+    await pending.save();
+
+    return res.status(200).json({
+      success: true,
+      message: "A new OTP has been sent to your email.",
+    });
+
+  } catch (error) {
+    console.error("Registration resend OTP error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to resend OTP. Please try again.",
+    });
+  }
+};
+
+
+const loginUser =async (req, res) => {
+    try {
+        const{ email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password are required",
+      });
+    }
+
+    const user = await User.findOne({
+      email: email.toLowerCase().trim(),
+    });
+
+    if (!user) {
+        return res.status(401).json({
+            success: false,
+            message: "Invalid email or password",
+        })
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+
+      if (!isMatch) {
+        return res.status(401).json({
+          success: false,
+          message: "Invalid email or password",
+        });
+      }
+        const token = jwt.sign(
+            { userId: user._id },
+            process.env.JWT_SECRET,
+            { expiresIn: "1d" }
+        );
+
+        res.cookie("token", token,{
+
+            httpOnly: true,
+            secure: process.env.NODE_ENV === "production",
+            sameSite: "lax",
+            maxAge: 24 * 60 * 60 * 1000,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: "Login successful",
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+            },
+        });
+    } catch (error) {
+    console.error("Login error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error during login",
+    });
+  }
+}
+
+
+const getProfile = async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("-password");
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile retrieved successfully",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error("Profile error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while retrieving profile",
+    });
+  }
+};
+
+
+const logoutUser = (req, res) => {
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: "Logout successful",
+  });
+};
+
+
+ 
+const requestPasswordOtp = async (req, res) => {
+  try {
+    const email = req.body.email?.trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Email is required.",
+      });
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "Email not found. Please register first.",
+      });
+    }
+
+    const now = Date.now();
+    const lastSent = user.resetOtpLastSentAt?.getTime() || 0;
+
+    const waitTimes = [
+      30 * 1000,
+      60 * 1000,
+      2 * 60 * 1000,
+      5 * 60 * 1000,
+    ];
+
+    const waitTime =
+      user.resetOtpResendCount >= 4
+        ? 60 * 60 * 1000
+        : waitTimes[user.resetOtpResendCount];
+
+    const remaining = lastSent + waitTime - now;
+
+    if (lastSent && remaining > 0) {
+      return res.status(429).json({
+        success: false,
+        message: "Please wait before requesting another OTP.",
+        retryAfterSeconds: Math.ceil(remaining / 1000),
+      });
+    }
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
+
+    const otpHash = crypto
+      .createHmac("sha256", process.env.JWT_SECRET)
+      .update(otp)
+      .digest("hex");
+
+    user.resetOtpHash = otpHash;
+    user.resetOtpExpires = new Date(now + 5 * 60 * 1000);
+    user.resetOtpAttempts = 0;
+    user.resetOtpLastSentAt = new Date(now);
+    user.resetOtpVerifiedAt = null;
+
+    if (lastSent) {
+      user.resetOtpResendCount =
+        user.resetOtpResendCount >= 4
+          ? 0
+          : user.resetOtpResendCount + 1;
+    }
+
+    await user.save();
+
+    try {
+      await sendEmail(
+        email,
+        "Your Password Reset OTP",
+        `<h2>Password Reset</h2>
+         <p>Your verification code is:</p>
+         <h1>${otp}</h1>
+         <p>This code expires in 5 minutes. Do not share it with anyone.</p>`
+      );
+    } catch (emailError) {
+      user.resetOtpHash = null;
+      user.resetOtpExpires = null;
+      user.resetOtpLastSentAt = null;
+      await user.save();
+      throw emailError;
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "If the account exists, an OTP will be sent.",
+    });
+  } catch (error) {
+    console.error("OTP email error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to send OTP. Please try again later.",
+    });
+  }
+};
+
+
+const verifyPasswordOtp = async (req, res) => {
+  try {
+    const email = req.body.email?.trim().toLowerCase();
+    const otp = req.body.otp?.trim();
+
+    if (!email || !/^\d{6}$/.test(otp || "")) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid 6-digit OTP.",
+      });
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user || !user.resetOtpHash || !user.resetOtpExpires) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired OTP.",
+      });
+    }
+
+    if (user.resetOtpExpires.getTime() < Date.now()) {
+      user.resetOtpHash = null;
+      user.resetOtpExpires = null;
+      user.resetOtpAttempts = 0;
+      await user.save();
+
+      return res.status(400).json({
+        success: false,
+        message: "OTP expired. Please request a new one.",
+      });
+    }
+
+    if (user.resetOtpAttempts >= 5) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many incorrect attempts. Request a new OTP.",
+      });
+    }
+
+    const submittedHash = crypto
+      .createHmac("sha256", process.env.JWT_SECRET)
+      .update(otp)
+      .digest("hex");
+
+    const valid = crypto.timingSafeEqual(
+      Buffer.from(submittedHash, "hex"),
+      Buffer.from(user.resetOtpHash, "hex")
+    );
+
+    if (!valid) {
+      user.resetOtpAttempts += 1;
+      await user.save();
+
+      return res.status(400).json({
+        success: false,
+        message: "Incorrect OTP.",
+        attemptsRemaining: 5 - user.resetOtpAttempts,
+      });
+    }
+
+    user.resetOtpHash = null;
+    user.resetOtpExpires = null;
+    user.resetOtpAttempts = 0;
+    user.resetOtpVerifiedAt = new Date();
+
+    await user.save();
+
+    const resetToken = jwt.sign(
+      { userId: user._id, purpose: "password-reset" },
+      process.env.JWT_SECRET,
+      { expiresIn: "10m" }
+    );
+
+    res.cookie("passwordResetToken", resetToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 10 * 60 * 1000,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "OTP verified successfully. You can reset your password.",
+    });
+  } catch (error) {
+    console.error("OTP verification error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "OTP verification failed.",
+    });
+  }
+};
+
+
+const resetPassword = async (req, res) => {
+  try {
+    const { password } = req.body;
+    const token = req.cookies.passwordResetToken;
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Please verify your OTP first.",
+      });
+    }
+
+    if (!password || password.length < 8 || password.length > 15) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be 8 to 15 characters.",
+      });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (decoded.purpose !== "password-reset") {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid password reset session.",
+      });
+    }
+
+    const user = await User.findById(decoded.userId);
+
+    if (!user || !user.resetOtpVerifiedAt) {
+      return res.status(401).json({
+        success: false,
+        message: "Please verify your OTP again.",
+      });
+    }
+
+    user.password = await bcrypt.hash(password, 12);
+
+    user.resetOtpVerifiedAt = null;
+    user.resetOtpHash = null;
+    user.resetOtpExpires = null;
+    user.resetOtpAttempts = 0;
+    user.resetOtpResendCount = 0;
+    user.resetOtpLastSentAt = null;
+    user.resetOtpBlockedUntil = null;
+
+    await user.save();
+
+    res.clearCookie("passwordResetToken", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Password reset successful. Please log in.",
+    });
+  } catch (error) {
+    console.error("Password reset error:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Password reset session expired. Verify your OTP again.",
+    });
+  }
+};
+
+
+module.exports = {
+  registerUser,
+  requestRegistrationOtp,
+  verifyRegistrationOtp,
+  resendRegistrationOtp,
+  loginUser,
+  getProfile,
+  logoutUser,
+  requestPasswordOtp,
+  verifyPasswordOtp,
+  resetPassword,
+};
