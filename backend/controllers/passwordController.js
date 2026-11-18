@@ -182,9 +182,10 @@ const verifyPasswordOtp = async (req, res) => {
 
     res.cookie("passwordResetToken", resetToken, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      secure: true,
+      sameSite: "none",
       maxAge: 10 * 60 * 1000,
+      path: "/",
     });
 
     return res.status(200).json({
@@ -253,8 +254,9 @@ const resetPassword = async (req, res) => {
 
     res.clearCookie("passwordResetToken", {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      secure: true,
+      sameSite: "none",
+      path: "/",
     });
 
     return res.status(200).json({
